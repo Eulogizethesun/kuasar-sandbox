@@ -10,10 +10,22 @@ Scenarios
   create        C concurrent creates; per-request wall and whole-batch wall,
                 p50/p95, warm-up rounds discarded up front, retries counted.
   pause-resume  create C -> pause all -> optional page-cache warm -> resume all,
-                one JSONL record per round with SIDs and wall times.
+                two warm-up rounds discarded by default, one JSONL record per
+                measured round with SIDs and wall times.
   analyze       parse a kuasar conductor journal/log by SID and print the
                 per-phase breakdown (create/resume phases, artifact prepare,
                 pause capture, launch total).
+
+Flags shared by the scenarios (place them after the subcommand):
+  --strict         one attempt per operation; the first error aborts the run.
+  --max-retries N  additional attempts per operation (default 2 = 3 total).
+  --append         allow appending to an existing --out/--ops-out file. Default
+                   is to refuse, so two arms cannot silently share one file.
+  --arm NAME       label recorded in samples and ops records (e.g. off|on).
+
+Every attempt is written to the --ops-out JSONL, including failed ones, with
+ok, attempt, phase (create|wait|pause|connect|restore) and err_class, so the
+failure rate is visible instead of being smoothed away by retries.
 
 Examples
   export E2B_API_URL=http://127.0.0.1:3000
@@ -27,11 +39,18 @@ Examples
   # full create -> pause -> resume at C=1,5,10 (needs local checkpoint dirs
   # for --warm; omit --warm for a pure remote/cold run)
   python3 e2b_stage_bench.py pause-resume --concurrency 1,5,10 -n 3 \
-      --warm --warm-base-root /var/lib/sandbox --out samples.jsonl
+      --warm --warm-base-root /var/lib/sandbox \
+      --out arm-off.jsonl --ops-out arm-off.ops.jsonl --arm off
+
+  # negative control: the same binary with vsock_reset_before_freeze=on must
+  # use a different out file (or --append) and its own arm label
+  python3 e2b_stage_bench.py pause-resume --concurrency 1 -n 30 --strict \
+      --out arm-on.jsonl --ops-out arm-on.ops.jsonl --arm on
 
   # phase breakdown after the run
-  journalctl -u kuasar-conductor --no-pager > conductor.log
+  journalctl -o json --no-pager --since "-20 min" > journal.json
   python3 e2b_stage_bench.py analyze --log conductor.log --samples samples.jsonl
+  python3 test/perf/stage_tree.py --ops arm-on.ops.jsonl --journal journal.json --strict
 """
 import argparse
 import json
@@ -44,24 +63,51 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-RETRIES = {"create": 0, "rounds": 0, "delete": 0}
+RETRIES = {"create": 0, "pause": 0, "resume": 0, "rounds": 0, "delete": 0}
+
+# --strict: one attempt per operation, first error aborts the run. --max-retries
+# is the number of *additional* attempts (the historical default of 3 total
+# attempts is preserved by the default of 2).
+STRICT = False
+MAX_RETRIES = 2
 
 # Per-operation wall-clock records (epoch ms) used by stage_tree.py to line
-# client observations up with the node-side perf marks in the journal.
+# client observations up with the node-side perf marks in the journal. Every
+# attempt is recorded (ok=false included) so failures are not invisible.
 OPS = []
 OPS_OUT = ""
 CUR_CONC = None
+ARM = ""
+APPEND = False
+SUPPRESS_OPS = False
 
 
-def record_op(kind, sid, start_epoch_s, end_epoch_s):
-    OPS.append({
+def attempt_budget():
+    return 1 if STRICT else 1 + max(0, MAX_RETRIES)
+
+
+def record_op(kind, sid, start_epoch_s, end_epoch_s, ok=True, attempt=1,
+              err=None, phase=""):
+    if SUPPRESS_OPS:
+        return
+    rec = {
         "op": kind,
         "sid": sid,
         "c": CUR_CONC,
         "start_ms": start_epoch_s * 1000.0,
         "end_ms": end_epoch_s * 1000.0,
         "dur_ms": (end_epoch_s - start_epoch_s) * 1000.0,
-    })
+        "ok": bool(ok),
+        "attempt": attempt,
+    }
+    if phase:
+        rec["phase"] = phase
+    if err is not None:
+        rec["err_class"] = type(err).__name__
+        rec["err"] = str(err)[:300]
+    if ARM:
+        rec["arm"] = ARM
+    OPS.append(rec)
 
 
 def flush_ops():
@@ -131,52 +177,123 @@ def wait_state(api, sid, want, timeout):
 
 def create_one(api, tpl, timeout):
     last = None
-    for attempt in range(3):
+    budget = attempt_budget()
+    for attempt in range(1, budget + 1):
         t = time.monotonic()
         t_epoch = time.time()
+        sid = ""
+        phase = "create"
         try:
             body = {"templateID": tpl, "timeout": timeout}
             r = api.call("POST", "/sandboxes", body, timeout=max(120, timeout))
             sid = (r or {}).get("sandboxID") or (r or {}).get("sandbox_id")
             if not sid:
                 raise RuntimeError("create returned no sandboxID")
+            phase = "wait"
             wait_state(api, sid, "running", timeout)
-            record_op("create", sid, t_epoch, t_epoch + (time.monotonic() - t))
-            return (time.monotonic() - t) * 1000.0, sid
         except Exception as exc:  # noqa: BLE001 - retry env flake like create_bench
+            end_epoch = t_epoch + (time.monotonic() - t)
+            record_op("create", sid, t_epoch, end_epoch, ok=False, attempt=attempt,
+                      err=exc, phase=phase)
             last = exc
+            if attempt >= budget:
+                break
             RETRIES["create"] += 1
-            print(f"  [create-retry{attempt + 1}] {str(exc)[:90]}", file=sys.stderr, flush=True)
+            print(f"  [create-retry{attempt}] {str(exc)[:90]}", file=sys.stderr, flush=True)
             time.sleep(1)
+            continue
+        end_epoch = t_epoch + (time.monotonic() - t)
+        record_op("create", sid, t_epoch, end_epoch, ok=True, attempt=attempt)
+        return (time.monotonic() - t) * 1000.0, sid
     raise last
 
 
 def pause_one(api, sid, memory, timeout):
-    t = time.monotonic()
-    t_epoch = time.time()
-    api.call("POST", f"/sandboxes/{sid}/pause", {"memory": memory}, timeout=timeout)
-    wait_state(api, sid, "paused", timeout)
-    record_op("pause", sid, t_epoch, t_epoch + (time.monotonic() - t))
-    return (time.monotonic() - t) * 1000.0
+    last = None
+    budget = attempt_budget()
+    for attempt in range(1, budget + 1):
+        t = time.monotonic()
+        t_epoch = time.time()
+        phase = "pause"
+        try:
+            api.call("POST", f"/sandboxes/{sid}/pause", {"memory": memory}, timeout=timeout)
+            phase = "wait"
+            wait_state(api, sid, "paused", timeout)
+        except Exception as exc:  # noqa: BLE001
+            end_epoch = t_epoch + (time.monotonic() - t)
+            record_op("pause", sid, t_epoch, end_epoch, ok=False, attempt=attempt,
+                      err=exc, phase=phase)
+            last = exc
+            if attempt >= budget:
+                break
+            if phase == "wait":
+                # The pause request was accepted; repeating it could be a no-op
+                # or a 409. Report the wait failure instead of duplicating it.
+                break
+            RETRIES["pause"] += 1
+            print(f"  [pause-retry{attempt} {sid}] {str(exc)[:90]}",
+                  file=sys.stderr, flush=True)
+            time.sleep(1)
+            continue
+        end_epoch = t_epoch + (time.monotonic() - t)
+        record_op("pause", sid, t_epoch, end_epoch, ok=True, attempt=attempt)
+        return (time.monotonic() - t) * 1000.0
+    raise last
 
 
 def resume_one(api, sid, timeout):
-    t = time.monotonic()
-    t_epoch = time.time()
-    api.call("POST", f"/sandboxes/{sid}/connect", {"timeout": timeout}, timeout=timeout)
-    wait_state(api, sid, "running", timeout)
-    record_op("resume", sid, t_epoch, t_epoch + (time.monotonic() - t))
-    return (time.monotonic() - t) * 1000.0
+    last = None
+    budget = attempt_budget()
+    for attempt in range(1, budget + 1):
+        t = time.monotonic()
+        t_epoch = time.time()
+        # "connect" is the POST /connect admission; "restore" is the client-side
+        # wait for the launch worker and VM restore. The guest restore ACK is
+        # node-side and not separately observable from this API, so it is part
+        # of the restore phase here.
+        phase = "connect"
+        try:
+            api.call("POST", f"/sandboxes/{sid}/connect", {"timeout": timeout}, timeout=timeout)
+            phase = "restore"
+            wait_state(api, sid, "running", timeout)
+        except Exception as exc:  # noqa: BLE001
+            end_epoch = t_epoch + (time.monotonic() - t)
+            record_op("resume", sid, t_epoch, end_epoch, ok=False, attempt=attempt,
+                      err=exc, phase=phase)
+            last = exc
+            if attempt >= budget:
+                break
+            if phase == "restore":
+                # /connect was accepted; re-sending it could duplicate the
+                # restore. Record the restore-phase failure and stop retrying.
+                break
+            RETRIES["resume"] += 1
+            print(f"  [resume-retry{attempt} {sid}] {str(exc)[:90]}",
+                  file=sys.stderr, flush=True)
+            time.sleep(1)
+            continue
+        end_epoch = t_epoch + (time.monotonic() - t)
+        record_op("resume", sid, t_epoch, end_epoch, ok=True, attempt=attempt)
+        return (time.monotonic() - t) * 1000.0
+    raise last
 
 
 def delete_one(api, sid):
-    for _ in range(3):
+    last = None
+    budget = attempt_budget()
+    for attempt in range(1, budget + 1):
         try:
             api.call("DELETE", "/sandboxes/" + sid, timeout=120)
             return
-        except Exception:  # noqa: BLE001 - cleanup is best effort
+        except Exception as exc:  # noqa: BLE001 - cleanup is best effort
+            last = exc
             RETRIES["delete"] += 1
+            if attempt >= budget:
+                break
             time.sleep(0.5)
+    if STRICT:
+        raise last
+    print(f"  [delete-failed {sid}] {str(last)[:90]}", file=sys.stderr, flush=True)
 
 
 def cleanup(api, sids):
@@ -246,6 +363,7 @@ def run_create_round(api, tpl, count, timeout):
 
 
 def cmd_create(args, api):
+    global SUPPRESS_OPS
     print(
         "# api=%s template=%s concurrency=%d rounds=%d settle=%.1fs"
         % (args.api, args.template, args.concurrency, args.rounds, args.settle_secs)
@@ -257,22 +375,31 @@ def cmd_create(args, api):
     print("-" * 100)
 
     for _ in range(args.warmup_rounds):
+        previous_suppress = SUPPRESS_OPS
+        SUPPRESS_OPS = True
         try:
             run_create_round(api, args.template, args.concurrency, args.timeout)
             break
         except Exception as exc:  # noqa: BLE001
+            if STRICT:
+                raise
             RETRIES["rounds"] += 1
             print(f"  [warmup-retry] {str(exc)[:90]}", file=sys.stderr, flush=True)
             time.sleep(5)
+        finally:
+            SUPPRESS_OPS = previous_suppress
     time.sleep(args.settle_secs)
 
     walls, reqs = [], []
     done, attempts = 0, 0
-    while done < args.rounds and attempts < args.rounds * 3:
+    max_attempts = args.rounds if STRICT else args.rounds * 3
+    while done < args.rounds and attempts < max_attempts:
         attempts += 1
         try:
             r = run_create_round(api, args.template, args.concurrency, args.timeout)
         except Exception as exc:  # noqa: BLE001
+            if STRICT:
+                raise
             RETRIES["rounds"] += 1
             print(f"  [round-retry] {str(exc)[:90]}", file=sys.stderr, flush=True)
             time.sleep(5)
@@ -295,9 +422,11 @@ def cmd_create(args, api):
     )
 
 
-def run_pr_round(api, tpl, count, args):
-    global CUR_CONC
+def run_pr_round(api, tpl, count, args, warmup=False):
+    global CUR_CONC, SUPPRESS_OPS
     CUR_CONC = count
+    previous_suppress = SUPPRESS_OPS
+    SUPPRESS_OPS = warmup
     t0 = time.monotonic()
     sids = []
     try:
@@ -318,6 +447,7 @@ def run_pr_round(api, tpl, count, args):
             list(pool.map(lambda s: resume_one(api, s, args.timeout), sids))
         resume_ms = (time.monotonic() - t2) * 1000.0
     finally:
+        SUPPRESS_OPS = previous_suppress
         cleanup(api, sids)
 
     flush_ops()
@@ -332,6 +462,15 @@ def run_pr_round(api, tpl, count, args):
         "warmed_bytes": warmed_bytes,
         "memory": args.memory,
     }
+    if ARM:
+        rec["arm"] = ARM
+    if warmup:
+        print(
+            "W C=%d round=%d create=%.1f pause=%.1f resume=%.1f (discarded)"
+            % (count, args.round_index, create_ms, pause_ms, resume_ms),
+            flush=True,
+        )
+        return rec
     with open(args.out, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec) + "\n")
     print(
@@ -345,15 +484,32 @@ def run_pr_round(api, tpl, count, args):
 def cmd_pause_resume(args, api):
     concs = [int(x) for x in args.concurrency.split(",") if x.strip()]
     print(
-        "# api=%s template=%s concurrency=%s rounds=%d memory=%s warm=%s"
-        % (args.api, args.template, concs, args.rounds, args.memory, args.warm)
+        "# api=%s template=%s concurrency=%s rounds=%d warmup=%d memory=%s warm=%s strict=%s"
+        % (args.api, args.template, concs, args.rounds, args.warmup_rounds,
+           args.memory, args.warm, STRICT)
     )
     for count in concs:
+        # Warm-up rounds are discarded: no samples, no ops records. They absorb
+        # first-touch page cache and runner-pool effects before the measured
+        # rounds, which matters for paired A/B runs.
+        for rnd in range(args.warmup_rounds):
+            args.round_index = rnd
+            try:
+                run_pr_round(api, args.template, count, args, warmup=True)
+            except Exception as exc:  # noqa: BLE001
+                if STRICT:
+                    raise
+                RETRIES["rounds"] += 1
+                print(f"  [warmup-retry C={count} r={rnd}] {str(exc)[:120]}",
+                      file=sys.stderr, flush=True)
+            time.sleep(args.settle_secs)
         for rnd in range(args.rounds):
             args.round_index = rnd
             try:
                 run_pr_round(api, args.template, count, args)
             except Exception as exc:  # noqa: BLE001
+                if STRICT:
+                    raise
                 RETRIES["rounds"] += 1
                 print(f"  [round-retry C={count} r={rnd}] {str(exc)[:120]}", file=sys.stderr, flush=True)
             time.sleep(args.settle_secs)
@@ -362,18 +518,26 @@ def cmd_pause_resume(args, api):
     if Path(args.out).exists():
         recs = [json.loads(line) for line in Path(args.out).read_text().splitlines() if line.strip()]
     print("\n# summary (wall, ms)")
-    print(f"{'conc':>4}  {'create_avg':>10} {'pause_avg':>9} {'resume_avg':>10} {'rounds':>6}")
+    header = f"{'conc':>4}  {'create_avg':>10} {'pause_avg':>9} {'resume_avg':>10} {'rounds':>6}"
+    if ARM:
+        header = f"{'conc':>4}  {'arm':>6}  " + header.split("  ", 1)[1]
+    print(header)
     for count in concs:
         xs = [r for r in recs if r.get("c") == count]
         if not xs:
             continue
-        print(
-            f"{count:>4}  {statistics.mean(r['create_ms'] for r in xs):>10.1f} "
-            f"{statistics.mean(r['pause_ms'] for r in xs):>9.1f} "
-            f"{statistics.mean(r['resume_ms'] for r in xs):>10.1f} {len(xs):>6}"
-        )
+        arms = sorted({r.get("arm", "") for r in xs})
+        for arm in arms:
+            subset = [r for r in xs if r.get("arm", "") == arm]
+            prefix = f"{count:>4}  {arm:>6}  " if ARM else f"{count:>4}  "
+            print(
+                f"{prefix}{statistics.mean(r['create_ms'] for r in subset):>10.1f} "
+                f"{statistics.mean(r['pause_ms'] for r in subset):>9.1f} "
+                f"{statistics.mean(r['resume_ms'] for r in subset):>10.1f} {len(subset):>6}"
+            )
     print(
-        f"# retries: create={RETRIES['create']} rounds_retried={RETRIES['rounds']} "
+        f"# retries: create={RETRIES['create']} pause={RETRIES['pause']} "
+        f"resume={RETRIES['resume']} rounds_retried={RETRIES['rounds']} "
         f"delete={RETRIES['delete']} (env flake, not a result metric)"
     )
 
@@ -458,7 +622,23 @@ def cmd_analyze(args, api=None):
         print(f"# rows written to {args.out}")
 
 
+def ensure_fresh(path, what):
+    """Refuse to append a new run onto an existing samples/ops file.
+
+    Reusing one path across arms silently mixes them in the summary; callers
+    that really want to extend a file must pass --append.
+    """
+    if not path or APPEND:
+        return
+    p = Path(path)
+    if p.exists() and p.stat().st_size > 0:
+        raise SystemExit(
+            "%s %s already exists and is non-empty; use a unique path per run/arm "
+            "or pass --append" % (what, path))
+
+
 def main():
+    global OPS_OUT, STRICT, MAX_RETRIES, APPEND, ARM
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--api", default=os.environ.get("E2B_API_URL", "http://127.0.0.1:3000"))
     p.add_argument("--key", default=os.environ.get("E2B_API_KEY", ""))
@@ -467,16 +647,36 @@ def main():
     p.add_argument("--settle-secs", type=float, default=1.0)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    c = sub.add_parser("create")
+    # Options shared by every scenario. They are attached to the subcommands so
+    # `... create --strict` works; pass them after the subcommand.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--strict", action="store_true",
+                        help="fail on first error; one attempt per operation")
+    common.add_argument("--max-retries", type=int, default=2,
+                        help="additional attempts per operation (default 2 = 3 total)")
+    common.add_argument("--append", action="store_true",
+                        help="allow appending to an existing --out/--ops-out file")
+    common.add_argument("--arm", default="", help="label recorded in samples/ops (e.g. off|on)")
+    # Also accept the endpoint flags after the subcommand. SUPPRESS keeps the
+    # top-level value when they are given in the usual (leading) position.
+    common.add_argument("--api", default=argparse.SUPPRESS)
+    common.add_argument("--key", default=argparse.SUPPRESS)
+    common.add_argument("--template", default=argparse.SUPPRESS)
+    common.add_argument("--timeout", type=int, default=argparse.SUPPRESS)
+    common.add_argument("--settle-secs", type=float, default=argparse.SUPPRESS)
+
+    c = sub.add_parser("create", parents=[common])
     c.add_argument("-c", "--concurrency", type=int, default=1)
     c.add_argument("-n", "--rounds", type=int, default=10)
     c.add_argument("--warmup-rounds", type=int, default=1)
     c.add_argument("--ops-out", default="", help="per-operation epoch-ms JSONL for stage_tree.py")
     c.set_defaults(func=cmd_create)
 
-    pr = sub.add_parser("pause-resume")
+    pr = sub.add_parser("pause-resume", parents=[common])
     pr.add_argument("--concurrency", default="1,5,10")
     pr.add_argument("-n", "--rounds", type=int, default=3)
+    pr.add_argument("--warmup-rounds", type=int, default=2,
+                    help="full create/pause/resume rounds discarded before measurement")
     pr.add_argument("--memory", type=lambda v: v.lower() != "false", default=True)
     pr.add_argument("--warm", action="store_true")
     pr.add_argument("--warm-base-root", default="/var/lib/sandbox")
@@ -484,16 +684,24 @@ def main():
     pr.add_argument("--ops-out", default="", help="per-operation epoch-ms JSONL for stage_tree.py")
     pr.set_defaults(func=cmd_pause_resume)
 
-    a = sub.add_parser("analyze")
+    a = sub.add_parser("analyze", parents=[common])
     a.add_argument("--log", required=True)
     a.add_argument("--samples", default="")
     a.add_argument("--out", default="")
     a.set_defaults(func=cmd_analyze)
 
     args = p.parse_args()
-    global OPS_OUT
+    STRICT = args.strict
+    MAX_RETRIES = max(0, args.max_retries)
+    APPEND = args.append
+    ARM = args.arm
     if getattr(args, "ops_out", ""):
         OPS_OUT = args.ops_out
+    if args.cmd != "analyze":
+        if args.ops_out:
+            ensure_fresh(args.ops_out, "ops output")
+        if args.cmd == "pause-resume":
+            ensure_fresh(args.out, "samples output")
     if args.cmd != "analyze" and not args.template:
         p.error("no template: pass --template or set E2B_TEMPLATE_ID")
     if args.cmd != "analyze" and not args.key:

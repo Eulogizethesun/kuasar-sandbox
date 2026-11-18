@@ -19,10 +19,22 @@ Rules (same as CubeSandbox's method):
     reported is a duration, so clock offsets cancel;
   * a stage with no observation is printed as "-", never as 0.
 
+design-v3 marks (vsock reset before freeze):
+  * pause   snap.vsock_reset (duration) and snap.vsock_reset_result
+            (published/acked, annotation only, never averaged);
+  * restore restore.dial.first_try, restore.dial_attempts and
+            restore.snapshot_state (transport_reset_pending, annotation only).
+  Boolean-ish marks go to a per-group "quality" object in --json as counters and
+  rates; they are deliberately absent from the averaged "stages" object.
+
+With --strict, a window that matches more than one mark set of the same
+(comp, op) is an error instead of silently selecting the longest set. This is
+the C>1-safe mode: the longest candidate may belong to another sandbox.
+
 Usage:
   journalctl -o json --no-pager --since "-10 min" > /tmp/journal.json
   python3 test/perf/stage_tree.py --ops ops.jsonl --journal /tmp/journal.json
-  python3 test/perf/stage_tree.py ... --json out.json --md out.md
+  python3 test/perf/stage_tree.py ... --json out.json --md out.md --strict
 """
 import argparse
 import json
@@ -30,6 +42,12 @@ import math
 import statistics
 import sys
 from collections import defaultdict
+
+# --strict turns silent best-effort attribution into a hard error: when a
+# (comp, op, sid) window matches more than one mark set, the script reports the
+# ambiguity and exits non-zero instead of picking the longest candidate.
+STRICT = False
+AMBIGUITIES = []
 
 # ---------------------------------------------------------------- references
 
@@ -210,6 +228,170 @@ def duration(mset, evt, idx=0):
     return rec.get("off_ms")
 
 
+def first_not_none(*values):
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def as_bool01(value):
+    """Normalize the boolean-ish fields of MarkKV marks to 0/1/None."""
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, (int, float)):
+        return 1 if value else 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("true", "yes", "on", "1"):
+            return 1
+        if text in ("false", "no", "off", "0"):
+            return 0
+    return None
+
+
+def evt_records(mset, evt):
+    got = mset["events"].get(evt) if mset else None
+    return [item[3] for item in got] if got else []
+
+
+def interval_value(mset, evt):
+    """A duration mark: prefer kind=interval, allow a cumulative begin/end pair.
+
+    Instrumentation for the design-v3 marks is expected to use Dur() (interval),
+    but accepting two cumulative records keeps the reader useful if a future
+    emitter records begin/end with Mark() instead.
+    """
+    value = duration(mset, evt)
+    if value is not None:
+        return value
+    offsets = [r.get("off_ms") for r in evt_records(mset, evt)
+               if r.get("kind") == "cumulative" and isinstance(r.get("off_ms"), (int, float))]
+    if len(offsets) >= 2:
+        return offsets[-1] - offsets[0]
+    return None
+
+
+def kv_value(mset, evt, *names):
+    for rec in evt_records(mset, evt):
+        for name in names:
+            if name in rec:
+                return rec[name]
+    return None
+
+
+def attempt_count(mset):
+    """restore.dial_attempts is a count, not a duration.
+
+    Accept a numeric annotation on one or more marks (the highest value wins, so
+    one mark per attempt is handled) and fall back to mark occurrences.
+    """
+    recs = evt_records(mset, "restore.dial_attempts")
+    values = []
+    for rec in recs:
+        for name in ("attempts", "attempt", "count", "n", "value"):
+            value = rec.get(name)
+            if isinstance(value, (int, float)):
+                values.append(int(value))
+    if values:
+        return max(values)
+    if recs:
+        value = duration(mset, "restore.dial_attempts")
+        if value is not None:
+            return max(1, int(round(value)))
+        return len(recs)
+    return None
+
+
+def fail_count(mset, evt):
+    """Count real failures; a MarkKV carrying false/0 is an explicit success."""
+    count = 0
+    for rec in evt_records(mset, evt):
+        value = rec.get("failed", rec.get("value"))
+        if value is None:
+            count += 1
+            continue
+        flag = as_bool01(value)
+        if flag is None:
+            count += 1
+        elif flag:
+            count += 1
+    return count
+
+
+def guestlink_quality(gl):
+    """Per-op quality for the restore handshake; booleans are never averaged."""
+    q = {}
+    first_try = interval_value(gl, "restore.dial.first_try")
+    attempts = attempt_count(gl)
+    failures = fail_count(gl, "restore.dial_failed")
+    ok = None
+    if attempts is not None:
+        ok = 1 if attempts == 1 and failures == 0 else 0
+    elif first_try is not None:
+        ok = 0 if failures else 1
+    elif gl is not None and gl["events"].get("restore.dial"):
+        ok = None  # legacy marks: dial exists but first-try outcome is unknown
+    if ok is None:
+        if gl is not None and (gl["events"].get("restore.dial") or failures):
+            q["restore.dial.first_try"] = {"n": 1, "ok": 0, "fail": 0, "unknown": 1}
+        return q
+    q["restore.dial.first_try"] = {"n": 1, "ok": ok, "fail": 1 - ok, "unknown": 0}
+    return q
+
+
+def snapshot_state_quality(runtime):
+    """restore.snapshot_state.transport_reset_pending as a distribution."""
+    if runtime is None or not runtime["events"].get("restore.snapshot_state"):
+        return {}
+    value = as_bool01(kv_value(runtime, "restore.snapshot_state",
+                               "transport_reset_pending", "pending"))
+    if value is None:
+        return {"restore.snapshot_state": {"n": 1, "pending_0": 0, "pending_1": 0, "unknown": 1}}
+    return {"restore.snapshot_state": {"n": 1, "pending_0": 1 - value,
+                                      "pending_1": value, "unknown": 0}}
+
+
+def reset_result_quality(runtime, take):
+    """snap.vsock_reset_result is an annotation (published/acked), never a stage."""
+    mset = None
+    for cand in (runtime, take):
+        if cand is not None and cand["events"].get("snap.vsock_reset_result"):
+            mset = cand
+            break
+    if mset is None:
+        return {}
+    published = as_bool01(kv_value(mset, "snap.vsock_reset_result", "published"))
+    acked = as_bool01(kv_value(mset, "snap.vsock_reset_result", "acked"))
+    timeout = kv_value(mset, "snap.vsock_reset_result", "timeout")
+    out = {"n": 1, "published": 0, "unpublished": 0, "acked": 0, "unacked": 0,
+           "timeout": 0, "unknown": 0}
+    if published is None and acked is None:
+        out["unknown"] = 1
+        return {"snap.vsock_reset_result": out}
+    if published is None:
+        out["unknown"] = 1
+    elif published:
+        out["published"] = 1
+    else:
+        out["unpublished"] = 1
+    if acked:
+        out["acked"] = 1
+    elif acked == 0:
+        out["unacked"] = 1
+    # A numeric timeout is the configured budget, not an event; only a real
+    # boolean true is counted as "timed out". Check bool first: bool is an int
+    # subclass in Python.
+    if isinstance(timeout, bool):
+        if timeout:
+            out["timeout"] = 1
+    elif isinstance(timeout, (int, float)):
+        pass
+    elif as_bool01(timeout) == 1:
+        out["timeout"] = 1
+    return {"snap.vsock_reset_result": out}
+
+
 def first_last(mset):
     if not mset:
         return None
@@ -247,10 +429,21 @@ def select_sets(sets, sid, start_ms, end_ms, comp=None, op=None):
 
 
 def pick(sets, sid, start, end, comp, op):
-    """Pick the single most relevant mark set; the longest one on ties."""
+    """Pick the single most relevant mark set; the longest one on ties.
+
+    With --strict an ambiguous match is an error (recorded and reported) rather
+    than silently resolved by length: under C>1 the longest set may belong to a
+    different sandbox.
+    """
     cands = select_sets(sets, sid, start, end, comp=comp, op=op)
     if not cands:
         return None
+    if len(cands) > 1 and STRICT:
+        AMBIGUITIES.append(
+            "ambiguous mark set for %s/%s sid=%s at %.1f-%.1f ms: %d candidates (%s)"
+            % (comp, op, sid or "-", start, end, len(cands),
+               ", ".join(sorted({"%s:%d ev" % (c.get("sid") or "no-sid",
+                                               len(c["events"])) for c in cands}))))
     cands.sort(key=lambda s: (len(s["events"]), s["first_wall_ns"]))
     return cands[-1]
 
@@ -295,9 +488,13 @@ def metrics_create(op, sets, lines):
     m["task.complete_prepare"] = duration(task, "task.complete_prepare")
 
     gl = pick(sets, None, start, end, "guestlink", "restore")
-    m["runtime.restore_dial"] = duration(gl, "restore.dial")
-    m["runtime.guest_ack"] = duration(gl, "restore.guest_ack")
+    m["runtime.restore_dial"] = interval_value(gl, "restore.dial")
+    m["restore.dial.first_try"] = interval_value(gl, "restore.dial.first_try")
+    m["restore.dial_attempts"] = attempt_count(gl)
+    m["runtime.guest_ack"] = interval_value(gl, "restore.guest_ack")
+    quality = guestlink_quality(gl)
     if runtime:
+        quality.update(snapshot_state_quality(runtime))
         m["runtime.open"] = interval(runtime, "restore.begin", "restore.open")
         m["runtime.memory_source"] = interval(runtime, "restore.open", "restore.memory_source")
         m["runtime.disks"] = interval(runtime, "restore.memory_source", "restore.disks")
@@ -321,7 +518,7 @@ def metrics_create(op, sets, lines):
     # launch-phase lines emitted by the conductor (cross-check / fallback)
     for phase, val in phases_for(lines, sid, "create"):
         m["phase." + phase] = val
-    return m
+    return m, quality
 
 
 def metrics_resume(op, sets, lines):
@@ -348,9 +545,13 @@ def metrics_resume(op, sets, lines):
     m["task.artifact"] = duration(task, "task.artifact")
     m["task.complete_prepare"] = duration(task, "task.complete_prepare")
     gl = pick(sets, None, start, end, "guestlink", "restore")
-    m["runtime.restore_dial"] = duration(gl, "restore.dial")
-    m["runtime.guest_ack"] = duration(gl, "restore.guest_ack")
+    m["runtime.restore_dial"] = interval_value(gl, "restore.dial")
+    m["restore.dial.first_try"] = interval_value(gl, "restore.dial.first_try")
+    m["restore.dial_attempts"] = attempt_count(gl)
+    m["runtime.guest_ack"] = interval_value(gl, "restore.guest_ack")
+    quality = guestlink_quality(gl)
     if runtime:
+        quality.update(snapshot_state_quality(runtime))
         m["runtime.open"] = interval(runtime, "restore.begin", "restore.open")
         m["runtime.memory_source"] = interval(runtime, "restore.open", "restore.memory_source")
         m["runtime.disks"] = interval(runtime, "restore.memory_source", "restore.disks")
@@ -371,7 +572,7 @@ def metrics_resume(op, sets, lines):
         m["tail." + key] = duration(tail, "tail." + key)
     for phase, val in phases_for(lines, sid, "resume"):
         m["phase." + phase] = val
-    return m
+    return m, quality
 
 
 def metrics_pause(op, sets, lines):
@@ -416,6 +617,11 @@ def metrics_pause(op, sets, lines):
         for k in ("validate", "history", "deps", "membarrier", "quiesce", "take",
                   "total"):
             m["snap." + k] = None
+    # design v3: reset-now happens after quiesce and before /vm.pause. Accept the
+    # mark in either the pause request set or the nested snapshot-take set.
+    m["snap.vsock_reset"] = first_not_none(interval_value(runtime, "snap.vsock_reset"),
+                                           interval_value(take, "snap.vsock_reset"))
+    quality = reset_result_quality(runtime, take)
     if take:
         m["take.vmm_pause"] = duration(take, "vmm.pause")
         m["take.disk"] = duration(take, "take.disk")
@@ -441,7 +647,7 @@ def metrics_pause(op, sets, lines):
         mm = RE_HANDSHAKE.search(msg)
         if mm:
             m["log.handshake_ms"] = float(mm.group(1))
-    return m
+    return m, quality
 
 
 def lines_for(lines, sid, start, end):
@@ -501,6 +707,9 @@ CREATE_TREE = [
     (3, "POST /vm.resume", "runtime.vm_resume", "cube.resume.restore_vm"),
     (3, "restore ACK + stdio MUX", "runtime.ack", "cube.resume.reset_vm"),
     (4, "vsock CONNECT/OK（dial）", "runtime.restore_dial", None),
+    (4, "dial first-try（一次成功）", "restore.dial.first_try", None),
+    (4, "dial attempts（次数）", "restore.dial_attempts", None),
+    (4, "快照 transport_reset_pending", "restore.snapshot_state", None, "annotation"),
     (4, "guest restore_ack", "runtime.guest_ack", None),
     (2, "readiness 等待（conductor 侧）", "tail.readiness_wait", None),
     (2, "workspace 磁盘 bind", "tail.workspace_bind", None),
@@ -530,6 +739,9 @@ RESUME_TREE = [
     (3, "POST /vm.resume", "runtime.vm_resume", "cube.resume.restore_vm"),
     (3, "restore ACK + stdio MUX", "runtime.ack", "cube.resume.reset_vm"),
     (4, "vsock CONNECT/OK（dial）", "runtime.restore_dial", None),
+    (4, "dial first-try（一次成功）", "restore.dial.first_try", None),
+    (4, "dial attempts（次数）", "restore.dial_attempts", None),
+    (4, "快照 transport_reset_pending", "restore.snapshot_state", None, "annotation"),
     (4, "guest restore_ack", "runtime.guest_ack", None),
     (2, "readiness 等待（conductor 侧）", "tail.readiness_wait", None),
     (2, "workspace 磁盘 bind", "tail.workspace_bind", None),
@@ -555,6 +767,8 @@ PAUSE_TREE = [
     (4, "runtime: history/dependency 准备", "snap.deps", None),
     (4, "runtime: memory barrier + memory.high", "snap.membarrier", None),
     (4, "guest quiesce（sync/drop_caches/MUX）", "snap.quiesce", "cube.pause.disconnect_agent"),
+    (4, "vsock reset-now（design v3, T）", "snap.vsock_reset", None),
+    (4, "reset 结果（published/acked）", "snap.vsock_reset_result", None, "annotation"),
     (4, "snapshot.Take 总计", "snap.take", "cube.pause.shim_total"),
     (5, "CH /vm.pause", "take.vmm_pause", None),
     (5, "磁盘 E 捕获", "take.disk", "cube.pause.commit_rootfs"),
@@ -580,7 +794,47 @@ def agg(rows, key):
     return len(vals), mean(vals), pct(vals, 50), pct(vals, 95)
 
 
-def render_tree(title, spec, rows, cube_col=True):
+QUALITY_KEYS = ("snap.vsock_reset_result", "restore.snapshot_state",
+                "restore.dial.first_try")
+
+
+def quality_label(key, a):
+    """Human-readable label for a boolean-ish annotation; never an average."""
+    if key == "snap.vsock_reset_result":
+        n = a.get("n", 0)
+        return ("published=%d/%d acked=%d/%d timeout=%d unknown=%d"
+                % (a.get("published", 0), n, a.get("acked", 0), n,
+                   a.get("timeout", 0), a.get("unknown", 0)))
+    if key == "restore.snapshot_state":
+        n = a.get("n", 0)
+        return ("pending=False %d/%d, pending=True %d/%d, unknown=%d"
+                % (a.get("pending_0", 0), n, a.get("pending_1", 0), n,
+                   a.get("unknown", 0)))
+    if key == "restore.dial.first_try":
+        known = a.get("ok", 0) + a.get("fail", 0)
+        return ("first-try ok=%d/%d fail=%d unknown=%d"
+                % (a.get("ok", 0), known, a.get("fail", 0), a.get("unknown", 0)))
+    return "-"
+
+
+def merge_quality(qrows):
+    """Sum the per-operation counters; labels stay rates, not means."""
+    out = {}
+    for key in QUALITY_KEYS:
+        entries = [q[key] for q in qrows if key in q]
+        if not entries:
+            continue
+        merged = {}
+        for entry in entries:
+            for name, value in entry.items():
+                if isinstance(value, (int, float)):
+                    merged[name] = merged.get(name, 0) + value
+        merged["label"] = quality_label(key, merged)
+        out[key] = merged
+    return out
+
+
+def render_tree(title, spec, rows, quality=None, cube_col=True):
     out = []
     out.append(f"### {title}")
     out.append("")
@@ -589,12 +843,20 @@ def render_tree(title, spec, rows, cube_col=True):
         header += f" {'CubeSandbox':>12}"
     out.append(header)
     out.append("-" * len(header))
-    for depth, label, key, cube_key in spec:
+    for item in spec:
+        depth, label, key, cube_key = item[:4]
+        kind = item[4] if len(item) > 4 else "metric"
+        pad = 46 - 4 * depth
         if key is None:
-            out.append(f"{'    ' * depth}{label:<{46 - 4 * depth}}{'':>3} {'[未观测]':>9}")
+            out.append(f"{'    ' * depth}{label:<{pad}}{'':>3} {'[未观测]':>9}")
+            continue
+        if kind == "annotation":
+            entry = (quality or {}).get(key)
+            text = entry.get("label") if entry else "-"
+            out.append(f"{'    ' * depth}{label:<{pad}}{'':>3} {text}")
             continue
         n, mu, p50, p95 = agg(rows, key)
-        line = (f"{'    ' * depth}{label:<{46 - 4 * depth}}{n:>3} "
+        line = (f"{'    ' * depth}{label:<{pad}}{n:>3} "
                 f"{fmt(mu):>9} {fmt(p50):>9} {fmt(p95):>9}")
         if cube_col:
             ref = CUBE_REF.get(cube_key) if cube_key else None
@@ -613,15 +875,22 @@ def summarize(rows, keys):
 
 
 def main():
+    global STRICT
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ops", required=True)
     ap.add_argument("--journal", required=True)
     ap.add_argument("--json", default="")
     ap.add_argument("--md", default="")
+    ap.add_argument("--strict", action="store_true",
+                    help="fail on ambiguous mark-set attribution instead of "
+                         "silently picking the longest candidate")
     args = ap.parse_args()
+    STRICT = args.strict
 
-    ops = load_ops(args.ops)
+    # Failed attempts are recorded by e2b_stage_bench.py too; only successful
+    # operations describe a stage tree.
+    ops = [op for op in load_ops(args.ops) if op.get("ok", True)]
     marks, lines = load_journal(args.journal)
     sets = list(group_marks(marks).values())
     if not sets:
@@ -629,19 +898,21 @@ def main():
               file=sys.stderr)
 
     grouped = defaultdict(list)
+    qualities = defaultdict(list)
     for op in ops:
         kind = op["op"]
         if kind == "create":
-            m = metrics_create(op, sets, lines)
+            m, q = metrics_create(op, sets, lines)
         elif kind == "resume":
-            m = metrics_resume(op, sets, lines)
+            m, q = metrics_resume(op, sets, lines)
         elif kind == "pause":
-            m = metrics_pause(op, sets, lines)
+            m, q = metrics_pause(op, sets, lines)
         else:
             continue
         m["sid"] = op["sid"]
         m["c"] = op.get("c")
         grouped[(kind, op.get("c"))].append(m)
+        qualities[(kind, op.get("c"))].append(q)
 
     doc = {"reference": CUBE_REF, "note": COMPARE_NOTE, "groups": {}}
     md = ["# kuasar-sandbox create / pause / resume 阶段分解", "",
@@ -651,11 +922,19 @@ def main():
         spec = {"create": CREATE_TREE, "resume": RESUME_TREE, "pause": PAUSE_TREE}[kind]
         title = {"create": "create", "resume": "resume（connect/wake）",
                  "pause": "pause"}[kind] + f" · C={conc} · n={len(rows)}"
-        md.append(render_tree(title, spec, rows))
+        quality = merge_quality(qualities.get((kind, conc), []))
+        md.append(render_tree(title, spec, rows, quality))
+        stages = {}
+        for item in spec:
+            key = item[2]
+            entry_kind = item[4] if len(item) > 4 else "metric"
+            if key and entry_kind == "metric":
+                stages[key] = dict(zip(("n", "mean_ms", "p50_ms", "p95_ms"),
+                                       agg(rows, key)))
         doc["groups"][f"{kind}:C{conc}"] = {
             "n": len(rows),
-            "stages": {k: dict(zip(("n", "mean_ms", "p50_ms", "p95_ms"), agg(rows, k)))
-                       for _, _, k, _ in spec if k},
+            "stages": stages,
+            "quality": quality,
         }
 
     text = "\n".join(md)
@@ -667,6 +946,11 @@ def main():
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump(doc, f, indent=1, ensure_ascii=False)
             f.write("\n")
+    if AMBIGUITIES:
+        print("\nstrict: ambiguous mark-set attribution:", file=sys.stderr)
+        for message in AMBIGUITIES:
+            print("  " + message, file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
