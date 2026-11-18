@@ -14,7 +14,9 @@
    envd `/init` 34.9 与 CubeSandbox `sandbox-probe` 38.6 基本相当。
 3. **create 312 ms**：kuasar 模板是**内存快照**（`e2b-snp-…`），create 走 restore 路径（与 resume 同一条 runtime），
    与 CubeSandbox 的 create（冒烟 36–49 ms，磁盘模板冷启）**不是同一路径**，绝对值不可比。
-4. **调度/单元启动不是瓶颈**：runner 池预热让 `unit.start` 只有 1.4 ms；CubeSandbox 的 `sandbox-start` 是 44.7 ms。
+4. **调度/单元启动不是瓶颈**：runner 池预热让“分配并启动 runner”只有 1.4 ms。CubeSandbox 的 `sandbox-start`（44.7 ms）
+   还包含 fork/exec 新 shim 与 create 机制，**口径不同、不可直接比**；能确定的是 kuasar 这一段不是瓶颈，
+   它的开销都落在后面的 restore/runtime。
 5. **C10**：单沙箱 pause 323.8 ms（单轮 wall 420 ms）、resume 479.0 ms；cleanup 仍占 pause 的 64%（205.8/323.8）；
    resume 的 `admission` 涨到 41.4 ms（route barrier 只占 0.39 ms，其余是 store/锁竞争，未细分）。
 
@@ -178,7 +180,7 @@ resume = Connect → 分配 runner → restore：UFFD source → spawn CH → /v
 |---|---:|---:|---|
 | ① 客户端 | 323.8 | 92.8 | 3.5× |
 | launch 总计 | 295.4 | — | |
-| unit.start | 1.4 | sandbox-start 44.7 | kuasar runner 池预热，CubeSandbox fork/exec 新 shim |
+| unit.start | 1.4 | （口径不同） | kuasar runner 池预热；CubeSandbox `sandbox-start` 44.7 还含 shim fork/exec 与 create，不能直接比 |
 | artifact + complete prepare | 6.3 + 19.9 | 含在 start | 读 Snapshot S/E 元数据 + 回执 |
 | runtime 总计 | 157.9 | CreatePodSandbox 39.2 | |
 | └ 打开元数据 + memory source | 16.1 | RestoreVm 11.1 | |
@@ -320,7 +322,7 @@ ACK 段是 guest 侧解冻 + 反向通道建链，属于 ABI 决定的往返；�
 | 4 | complete prepare | 19.9 | — | — | 回执与 final spec 合并为一次 RPC |
 | 5 | ctl exec/连接（pause） | 19.7 | 0 | +19.7 | capture 改为持久 UDS 客户端，避免每次 exec `sandbox-ctl` |
 | 6 | envd /init | 34.9 | 38.6 | -3.7 | 已对等 |
-| 7 | unit.start | 1.4 | 44.7 | -43.3 | kuasar 更优（池化） |
+| 7 | runner 单元分配/启动 | 1.4 | — | — | kuasar 池化，已不是瓶颈（不与 `sandbox-start` 直接比） |
 
 ## 7. 复现
 
