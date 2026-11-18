@@ -61,7 +61,7 @@
     [客户端等待] response → state=running（含轮询）       9    310.84    310.76    363.65            -
     ③ 异步 launch 总计（conductor）                   9    284.03    280.55    345.53        92.80
         accept→launch worker 调度延迟               9      0.68      0.67      0.89            -
-        runner 单元启动（systemd 到 assigned）         9      1.42      1.33      1.98        44.70
+        runner 单元启动（systemd 到 assigned）         9      1.42      1.33      1.98            -
             pidfile / session                   9      0.05      0.05      0.05            -
             等待 assignment（config-socket）        9      0.98      0.94      1.32            -
             readiness socket 连接                 9      0.06      0.06      0.07            -
@@ -131,7 +131,7 @@
     [客户端等待] response → state=running（含轮询）       9    322.11    314.05    360.54            -
     ③ 异步 launch 总计（conductor）                   9    295.38    298.33    343.75            -
         accept→launch worker 调度延迟               9      0.07      0.07      0.10            -
-        runner 单元启动（systemd 到 assigned）         9      1.29      1.31      1.38        44.70
+        runner 单元启动（systemd 到 assigned）         9      1.29      1.31      1.38            -
         runner 任务引导（bootstrap）                  9      0.75      0.70      1.03            -
         artifact prepare（runner 进程内）            9      6.33      6.28      6.89            -
         complete prepare（回执 + final spec）       9     19.89     19.44     22.60            -
@@ -212,7 +212,7 @@ ACK 段是 guest 侧解冻 + 反向通道建链，属于 ABI 决定的往返；�
     [客户端等待] response → state=running（含轮询）      50    422.12    427.14    500.09            -
     ③ 异步 launch 总计（conductor）                  50    397.69    406.24    485.95        92.80
         accept→launch worker 调度延迟              50      0.63      0.57      0.78            -
-        runner 单元启动（systemd 到 assigned）        50      3.16      1.78     12.62        44.70
+        runner 单元启动（systemd 到 assigned）        50      3.16      1.78     12.62            -
             pidfile / session                  50      0.05      0.05      0.07            -
             等待 assignment（config-socket）       50      2.58      1.26     12.11            -
             readiness socket 连接                50      0.07      0.07      0.10            -
@@ -282,7 +282,7 @@ ACK 段是 guest 侧解冻 + 反向通道建链，属于 ABI 决定的往返；�
     [客户端等待] response → state=running（含轮询）      50    437.62    442.19    505.48            -
     ③ 异步 launch 总计（conductor）                  50    407.82    409.95    484.79            -
         accept→launch worker 调度延迟              50      0.09      0.08      0.13            -
-        runner 单元启动（systemd 到 assigned）        50      3.42      1.57     21.41        44.70
+        runner 单元启动（systemd 到 assigned）        50      3.42      1.57     21.41            -
         runner 任务引导（bootstrap）                 50      3.14      1.03     15.46            -
         artifact prepare（runner 进程内）           50      6.82      6.82      7.59            -
         complete prepare（回执 + final spec）      50     79.68     70.89    143.74            -
