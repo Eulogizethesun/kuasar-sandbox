@@ -2,6 +2,7 @@
 
 > 范围：只改 restore 时 host↔guest 控制通道的建立（差异 C）。不改 guest ABI、不改 MUX、不动模板/进程/API。
 > 目标：restore 的 dial 从 60–70 ms 降到 1–3 ms；正确性不退化（失败自动回退到现有 gate）。
+> **实测结论（2026-11-18）：假设被证伪，本方案不要启用。** gate 只占 ~12 ms，剩下的 55–70 ms 是 restore 后第一次 host→guest 连接的固定成本；去掉 gate 并不能去掉它。详见 §10。
 > 版本记录：v1 RST 注入（已否决：连接表在冻结时基本为空，覆盖不到 guest 残留）→ v2 reset-before-freeze → **v3 补齐 CH 状态机/ACK 语义/失败回退/测试口径**。
 
 ## 1. 背景（实测）
@@ -187,3 +188,28 @@ CH 测试钩子（`KUASAR_TEST_HOOKS=1`，release 二进制忽略）：
 2. `reset_published` 是否需要提供诊断端点（`PUT timeout_ms=0` 返回状态）。
 3. `handleExportRequest` 是否永远不需要 reset（当前结论：不需要）。
 4. v1 的 `connections` 导出是否保留作诊断（不作为机制）。
+
+## 10. 实测结果（2026-11-18）：假设被证伪
+
+实现并部署了 `ch-patches/0015` + host 开关后，在同一二进制、2C2G、C=1、n=9、WARM=1 下做受控 A/B（`KUASAR_VSOCK_RESET_BEFORE_FREEZE=off|on`）：
+
+| arm | snapshot `pending` | dial.unix | **dial.connect_ok** | restore.ack | resume 客户端 | pause 客户端 |
+|---|---|---:|---:|---:|---:|---:|
+| off（现有 gate） | true | 0.03 | **67.1** | 94.7 | 260.8 | 192.9 |
+| on（reset-before-freeze） | false | 0.03 | **54.7** | 90.4 | 255.0 | 196.2 |
+
+- reset 在本机 pause 阶段完成得很快：`snap.vsock_reset` 均值 **1.18 ms**，`acked=true`，快照 `pending=false` —— 协议实现是工作的。
+- 但 **`CONNECT/OK` 仍然要 55–70 ms**，与 gate 无关；`dial.unix` 始终 0.03 ms（CH 的 listener 没问题）。
+- 再次做"resume 后延迟拨号"扫描（在 reset-before-freeze 下，延迟 0/10/20/30/50/80 ms）：
+  dial = **55.3 / 61.6 / 48.4 / 66.3 / 72.9 / 42.6 ms** —— **没有 readiness 曲线**，延迟拨号并不变快。
+  说明这 55 ms 不是"等 guest 就绪的时间窗"，而是**第一次连接请求本身触发的 guest 侧工作**（vsock 收包路径冷启动）。
+- 早先"延迟 100 ms 后 dial 0.8 ms"的结论只在 **gate 开启**时成立：gate 把 `OK` 扣到 guest 处理完 transport reset 之后，而 reset 处理顺带把 vsock 栈"预热"了；没有 reset 时，第一次 `CONNECT` 自己付这笔预热成本。
+
+**结论**：
+
+1. 本方案收益约 6–12 ms（客户端），代价是 pause +1–2 ms 和一套 CH 状态机——**不值得启用**，保留为实验/诊断代码（默认 off）。
+2. 真正的瓶颈是"restore 后第一次 host→guest vsock 连接要 ~55–70 ms"，需要沿这条线继续查：
+   - CH 侧打点：记录 CONNECT 写入、guest 响应、OK 返回的时间戳（区分 CH 与 guest）；
+   - guest 侧：`virtio_vsock` 收包路径的 ftrace/kprobe，或该窗口内的 UFFD 缺页计数；
+   - 试预取 guest 的 vsock/中断/kthread 页（冷/热快照差异约 15 ms，剩余 ~40 ms 可能是内核路径）。
+3. `pending=true` 的 gate 路径在正确性上没有损失，建议保持现状（本方案的开关保持 off）。
