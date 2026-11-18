@@ -46,6 +46,34 @@ from pathlib import Path
 
 RETRIES = {"create": 0, "rounds": 0, "delete": 0}
 
+# Per-operation wall-clock records (epoch ms) used by stage_tree.py to line
+# client observations up with the node-side perf marks in the journal.
+OPS = []
+OPS_OUT = ""
+CUR_CONC = None
+
+
+def record_op(kind, sid, start_epoch_s, end_epoch_s):
+    OPS.append({
+        "op": kind,
+        "sid": sid,
+        "c": CUR_CONC,
+        "start_ms": start_epoch_s * 1000.0,
+        "end_ms": end_epoch_s * 1000.0,
+        "dur_ms": (end_epoch_s - start_epoch_s) * 1000.0,
+    })
+
+
+def flush_ops():
+    if not OPS_OUT or not OPS:
+        return
+    path = Path(OPS_OUT)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        for rec in OPS:
+            f.write(json.dumps(rec) + "\n")
+    OPS.clear()
+
 
 def percentile(data, p):
     s = sorted(data)
@@ -105,6 +133,7 @@ def create_one(api, tpl, timeout):
     last = None
     for attempt in range(3):
         t = time.monotonic()
+        t_epoch = time.time()
         try:
             body = {"templateID": tpl, "timeout": timeout}
             r = api.call("POST", "/sandboxes", body, timeout=max(120, timeout))
@@ -112,6 +141,7 @@ def create_one(api, tpl, timeout):
             if not sid:
                 raise RuntimeError("create returned no sandboxID")
             wait_state(api, sid, "running", timeout)
+            record_op("create", sid, t_epoch, t_epoch + (time.monotonic() - t))
             return (time.monotonic() - t) * 1000.0, sid
         except Exception as exc:  # noqa: BLE001 - retry env flake like create_bench
             last = exc
@@ -123,15 +153,19 @@ def create_one(api, tpl, timeout):
 
 def pause_one(api, sid, memory, timeout):
     t = time.monotonic()
+    t_epoch = time.time()
     api.call("POST", f"/sandboxes/{sid}/pause", {"memory": memory}, timeout=timeout)
     wait_state(api, sid, "paused", timeout)
+    record_op("pause", sid, t_epoch, t_epoch + (time.monotonic() - t))
     return (time.monotonic() - t) * 1000.0
 
 
 def resume_one(api, sid, timeout):
     t = time.monotonic()
+    t_epoch = time.time()
     api.call("POST", f"/sandboxes/{sid}/connect", {"timeout": timeout}, timeout=timeout)
     wait_state(api, sid, "running", timeout)
+    record_op("resume", sid, t_epoch, t_epoch + (time.monotonic() - t))
     return (time.monotonic() - t) * 1000.0
 
 
@@ -198,10 +232,13 @@ def create_batch(api, tpl, count, timeout):
 
 
 def run_create_round(api, tpl, count, timeout):
+    global CUR_CONC
+    CUR_CONC = count
     t0 = time.monotonic()
     sids = []
     try:
         reqs, sids = create_batch(api, tpl, count, timeout)
+        flush_ops()
     finally:
         wall_ms = (time.monotonic() - t0) * 1000.0
         cleanup(api, sids)
@@ -259,6 +296,8 @@ def cmd_create(args, api):
 
 
 def run_pr_round(api, tpl, count, args):
+    global CUR_CONC
+    CUR_CONC = count
     t0 = time.monotonic()
     sids = []
     try:
@@ -281,6 +320,7 @@ def run_pr_round(api, tpl, count, args):
     finally:
         cleanup(api, sids)
 
+    flush_ops()
     rec = {
         "c": count,
         "round": args.round_index,
@@ -431,6 +471,7 @@ def main():
     c.add_argument("-c", "--concurrency", type=int, default=1)
     c.add_argument("-n", "--rounds", type=int, default=10)
     c.add_argument("--warmup-rounds", type=int, default=1)
+    c.add_argument("--ops-out", default="", help="per-operation epoch-ms JSONL for stage_tree.py")
     c.set_defaults(func=cmd_create)
 
     pr = sub.add_parser("pause-resume")
@@ -440,6 +481,7 @@ def main():
     pr.add_argument("--warm", action="store_true")
     pr.add_argument("--warm-base-root", default="/var/lib/sandbox")
     pr.add_argument("--out", default="e2b-stage-samples.jsonl")
+    pr.add_argument("--ops-out", default="", help="per-operation epoch-ms JSONL for stage_tree.py")
     pr.set_defaults(func=cmd_pause_resume)
 
     a = sub.add_parser("analyze")
@@ -449,6 +491,9 @@ def main():
     a.set_defaults(func=cmd_analyze)
 
     args = p.parse_args()
+    global OPS_OUT
+    if getattr(args, "ops_out", ""):
+        OPS_OUT = args.ops_out
     if args.cmd != "analyze" and not args.template:
         p.error("no template: pass --template or set E2B_TEMPLATE_ID")
     if args.cmd != "analyze" and not args.key:

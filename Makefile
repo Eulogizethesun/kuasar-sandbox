@@ -46,7 +46,7 @@ NODE_INFRA_ENGINE ?= podman
 PERF_TARGETS := perf-sandbox perf-sandbox-manifest perf-sandbox-working-set perf-density perf-warmpool-dedup
 
 .PHONY: all build node-infra-image collect e2e-zot e2e-versitygw e2e-tools assemble-e2e release verify-prebuilt vet test test-ci-tools test-release-tools test-perf-tools test-uffd-performance-gate clean help demo \
-	        bench e2e-fixtures test-e2e perf dedup-report perf-e2b \
+	        bench e2e-fixtures test-e2e perf dedup-report perf-e2b perf-tree \
 	        $(PERF_TARGETS)
 
 all: build
@@ -165,6 +165,13 @@ perf-e2b:
 	@[ -n "$${E2B_TEMPLATE_ID:-}" ] || { echo "E2B_TEMPLATE_ID must be set" >&2; exit 1; }
 	@[ -n "$${E2B_API_KEY:-}" ] || { echo "E2B_API_KEY must be set" >&2; exit 1; }
 	bash test/perf/e2b-stage-bench.sh
+
+# Turn one collection (client ops + `journalctl -o json`) into a nested stage
+# tree for create / pause / resume. See docs/guides/pause-resume-stage-decomposition.md.
+perf-tree:
+	@[ -n "$${OPS:-}" ] || { echo "OPS must point at the .ops.jsonl from --ops-out" >&2; exit 1; }
+	@[ -n "$${JOURNAL:-}" ] || { echo "JOURNAL must point at journalctl -o json output" >&2; exit 1; }
+	python3 test/perf/stage_tree.py --ops $${OPS} --journal $${JOURNAL}
 
 # Aggregate perf: accelerator's perf-cache + this repo's perfs.
 perf: build

@@ -30,17 +30,18 @@ MODE="${MODE:-pause-resume}"
 CONCURRENCY="${CONCURRENCY:-1,5,10}"
 ROUNDS="${ROUNDS:-3}"
 OUT="${OUT:-$HERE/../results/e2b-stage-samples.jsonl}"
+OPS_OUT="${OPS_OUT:-$OUT.ops.jsonl}"
 mkdir -p "$(dirname "$OUT")"
 
 DRIVER="$HERE/e2b_stage_bench.py"
 case "$MODE" in
   create)
+    ARGS=(create -c "$CONCURRENCY" -n "$ROUNDS" --ops-out "$OPS_OUT")
     python3 "$DRIVER" --api "$E2B_API_URL" --key "$E2B_API_KEY" \
-      --template "$E2B_TEMPLATE_ID" create \
-      -c "$CONCURRENCY" -n "$ROUNDS"
+      --template "$E2B_TEMPLATE_ID" "${ARGS[@]}"
     ;;
   pause-resume)
-    ARGS=(pause-resume --concurrency "$CONCURRENCY" -n "$ROUNDS" --out "$OUT")
+    ARGS=(pause-resume --concurrency "$CONCURRENCY" -n "$ROUNDS" --out "$OUT" --ops-out "$OPS_OUT")
     if [ "${WARM:-0}" = 1 ]; then
       ARGS+=(--warm --warm-base-root "${WARM_BASE_ROOT:-/var/lib/sandbox}")
     fi
