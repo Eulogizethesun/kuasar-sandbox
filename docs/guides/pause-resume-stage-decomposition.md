@@ -357,3 +357,81 @@ python3 test/perf/stage_tree.py --ops /tmp/c1.jsonl.ops.jsonl \
   两者“pause 后还能不能保留进程”本就不同，cleanup 不可完全对消。
 - 模板/镜像不对等：kuasar `python:3.12-slim`（43.5 MB）vs CubeSandbox `sandbox-code-envd-ci`（≈379 MiB）；
   本报告只比较**同一平台内的阶段结构**，跨平台数字看量级。
+
+## 9. 补充实验：create C1 归因（2026-11-18 晚）
+
+第 3 节的 create 树是在 **runner 池未开启**（`units.runner_pool_size` 缺省 0）时采集的。补做两个实验：
+
+### 9.1 开 runner 池：create 312 → 245 ms
+
+`conductor.yaml` 加：
+
+```yaml
+units:
+  runner_pool_size: 2
+```
+
+重启后 systemd 常驻 2 个 idle `sandbox-runner@`，create C1（n=9）从 **312.4 → 244.7 ms（−67.3，−21%）**。
+未开池时 `launch.enter → runner 进程真正开始` 平均 **49.4 ms**（systemd StartUnit + fork/exec），
+开池后这段变成 0（单元已就绪，只等 assignment）。
+
+### 9.2 restore 段再拆：dial 67 ms + guest ack 40 ms
+
+在 `guestlink.OpenMUXViaRestoreContext` 里把原来的 `restore ACK + MUX`（108.5 ms）再拆成：
+
+| 子段 | 含义 | mean | 范围 |
+|---|---|---:|---:|
+| `restore.dial` | unix dial CH hybrid-vsock + `CONNECT`/`OK` 握手（等 guest accept） | **~67** | 54–98 |
+| `restore.guest_ack` | 写 `restore{epoch}` → guest 回 `restore_ack`（含 usage-report barrier、MUX 重建） | **~40** | 34–48 |
+
+没有出现 `pre-request connect recovered on attempt N` 日志，说明不是重试退避；两次都是第一次连接就成功，
+耗时在**握手与 guest 处理本身**。
+
+### 9.3 create C1 账本（开池，n=10，含 1 次预热）
+
+| 段 | ms | 占客户端 |
+|---|---:|---:|
+| ① 客户端（含 26 ms 轮询量化） | 251.7 | 100% |
+| API 窗口（HTTP + admission） | 1.5 | 0.6% |
+| runner 池等待 | ~0 | 0% |
+| bootstrap + artifact prepare | 9.8 | 3.9% |
+| complete prepare（config-socket 回执） | 20.5 | 8.1% |
+| exec `sandbox-ctl` | 14.3 | 5.7% |
+| **restore 总计** | **162.1** | **64%** |
+| ├ 打开元数据 + memory source + 磁盘图 | 17.2 | 6.8% |
+| ├ spawn CH + CH API ready | 34.6 | 13.7% |
+| ├ `/vm.resume` | 1.6 | 0.6% |
+| └ vsock dial + guest ack | 108.5 | 43% |
+| envd `/init` | 14.5 | 5.8% |
+| store commit + publish | 0.6 | 0.2% |
+| 客户端轮询量化 | 26.2 | 10.4% |
+
+按 CubeSandbox 的 create 口径（`POST /sandboxes` 返回即完成、无轮询），kuasar 的可比数字是 **~220 ms**（`orch.launch.exit`），
+仍为 CubeSandbox v0.7.1 C1（57.6 ms）的 3.8×。
+
+### 9.4 与 CubeSandbox C1（57.6 ms）逐段对照
+
+| 段 | kuasar（开池） | CubeSandbox v0.7.1 C1 | 差 | 说明 |
+|---|---:|---:|---:|---|
+| HTTP + admission | 1.5 | ~9.6 | −8 | kuasar 没有 CubeAPI/Master 壳层 |
+| runner/进程启动 | ~0（池化） | ~7（shim spawn） | −7 | 池化后更快；未开池时 49 |
+| bootstrap + artifact + complete prepare | 30.3 | — | +30 | 读 S/E 元数据 + 两次 config-socket RPC |
+| exec `sandbox-ctl` | 14.3 | 0 | +14 | CubeSandbox shim 常驻，不 exec 新进程 |
+| restore 总计 | 162.1 | 27.6（CreatePodSandbox） | +134 | |
+| ├ 元数据/内存/磁盘 | 17.2 | 8.0（RestoreVm） | +9 | FICLONE+惰性内存 vs 打开 S/E + UFFD source |
+| ├ spawn CH + API ready | 34.6 | 含在 RestoreVm/LaunchVmm 1.0 | +26~34 | CH 进程启动 + /vm.info 就绪 |
+| ├ `/vm.resume` | 1.6 | 含 | — | 两边都很快 |
+| └ vsock dial + guest ack | 108.5 | 4.5（ResetVm） | +104 | **最大单项** |
+| envd `/init` | 14.5 | 9–14（sandbox-probe） | ~0 | 对等 |
+| store commit + publish | 0.6 | — | — | |
+| 客户端轮询 | 26.2 | 0（同步接口） | +26 | 测量口径差异 |
+
+**create 的结论**：
+
+1. 不是调度问题：开池后 runner 启动为 0；不开池的 49 ms 也只是配置缺失（`runner_pool_size` 默认 0）。
+2. 不是 VMM 恢复本身：`/vm.resume` 只要 1.6 ms，状态恢复不慢。
+3. **47% 的客户端时间在 restore 后的 guest 握手**：hybrid-vsock `CONNECT/OK` 67 ms + `restore_ack` 40 ms。
+   CubeSandbox 的 agent 通道在 restore 时只花 4.5 ms。下一步应查：CH hybrid-vsock 的 accept 是否被 guest 调度/缺页拖慢
+   （UFFD 惰性内存下，guest vsock/agent 代码页第一次触碰要回读快照），以及 guest 侧 usage-report barrier 能否与 ACK 解耦。
+4. 进程模型带来 ~44 ms 固定开销（artifact/complete prepare 30 + exec sandbox-ctl 14），CubeSandbox 靠常驻 shim 省掉。
+5. 另有 26 ms 是客户端 50 ms 轮询的量化误差，按对方口径应剔除。

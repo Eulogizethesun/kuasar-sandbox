@@ -294,6 +294,9 @@ def metrics_create(op, sets, lines):
     m["task.artifact"] = duration(task, "task.artifact")
     m["task.complete_prepare"] = duration(task, "task.complete_prepare")
 
+    gl = pick(sets, None, start, end, "guestlink", "restore")
+    m["runtime.restore_dial"] = duration(gl, "restore.dial")
+    m["runtime.guest_ack"] = duration(gl, "restore.guest_ack")
     if runtime:
         m["runtime.open"] = interval(runtime, "restore.begin", "restore.open")
         m["runtime.memory_source"] = interval(runtime, "restore.open", "restore.memory_source")
@@ -344,6 +347,9 @@ def metrics_resume(op, sets, lines):
     m["task.bootstrap"] = duration(task, "task.bootstrap")
     m["task.artifact"] = duration(task, "task.artifact")
     m["task.complete_prepare"] = duration(task, "task.complete_prepare")
+    gl = pick(sets, None, start, end, "guestlink", "restore")
+    m["runtime.restore_dial"] = duration(gl, "restore.dial")
+    m["runtime.guest_ack"] = duration(gl, "restore.guest_ack")
     if runtime:
         m["runtime.open"] = interval(runtime, "restore.begin", "restore.open")
         m["runtime.memory_source"] = interval(runtime, "restore.open", "restore.memory_source")
@@ -494,6 +500,8 @@ CREATE_TREE = [
     (3, "CH API ready", "runtime.api_ready", None),
     (3, "POST /vm.resume", "runtime.vm_resume", "cube.resume.restore_vm"),
     (3, "restore ACK + stdio MUX", "runtime.ack", "cube.resume.reset_vm"),
+    (4, "vsock CONNECT/OK（dial）", "runtime.restore_dial", None),
+    (4, "guest restore_ack", "runtime.guest_ack", None),
     (2, "readiness 等待（conductor 侧）", "tail.readiness_wait", None),
     (2, "workspace 磁盘 bind", "tail.workspace_bind", None),
     (2, "envd /init", "tail.envd_init", "cube.resume.probe"),
@@ -521,6 +529,8 @@ RESUME_TREE = [
     (3, "CH API ready", "runtime.api_ready", None),
     (3, "POST /vm.resume", "runtime.vm_resume", "cube.resume.restore_vm"),
     (3, "restore ACK + stdio MUX", "runtime.ack", "cube.resume.reset_vm"),
+    (4, "vsock CONNECT/OK（dial）", "runtime.restore_dial", None),
+    (4, "guest restore_ack", "runtime.guest_ack", None),
     (2, "readiness 等待（conductor 侧）", "tail.readiness_wait", None),
     (2, "workspace 磁盘 bind", "tail.workspace_bind", None),
     (2, "envd /init", "tail.envd_init", "cube.resume.probe"),
